@@ -17,14 +17,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.apache.avro.SchemaParseException;
-
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.confluent.kafka.serializers.KafkaAvroSerializer;
 import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
+import org.apache.avro.AvroRuntimeException;
 import org.apache.avro.Schema;
+import org.apache.avro.SchemaParseException;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -72,14 +72,14 @@ public final class SendKafkaMessage {
     private static final Pattern UNDEFINED_NAME = Pattern.compile(
             "\"([^\"]+)\" is not a defined name",
             Pattern.CASE_INSENSITIVE);
-    private static final Pattern CANT_REDEFINE = Pattern.compile(
-            "Can't redefine:\\s*(\\S+)",
-            Pattern.CASE_INSENSITIVE);
+    private static final Set<String> AVRO_BUILTINS = Set.of(
+            "null", "boolean", "int", "long", "float", "double", "bytes", "string",
+            "record", "enum", "array", "map", "fixed");
 
     /**
      * Loads the main schema plus only the named-type dependencies it needs.
-     * Sibling {@code .avsc} files are pulled in on demand when Avro reports a missing
-     * named type, so unrelated/duplicate schemas in the same folder are ignored.
+     * Dependencies are discovered from the primary schema JSON and parsed first;
+     * the primary file is always parsed last so its record fields are fully set.
      */
     static Schema loadSchema(Path mainSchemaPath, List<Path> extraSchemaPaths) throws IOException {
         Path main = mainSchemaPath.toAbsolutePath().normalize();
@@ -87,29 +87,97 @@ public final class SendKafkaMessage {
             throw new IllegalArgumentException("Schema file not found: " + main);
         }
 
+        String mainTypeName = readDeclaredFullName(main);
         Map<String, Path> schemasByTypeName = indexSiblingSchemas(main.getParent());
-        Set<Path> candidates = new LinkedHashSet<>();
-        candidates.add(main);
+        // Prefer the caller's primary file for its own type name.
+        if (mainTypeName != null) {
+            schemasByTypeName.put(mainTypeName, main);
+            int dot = mainTypeName.lastIndexOf('.');
+            if (dot >= 0) {
+                schemasByTypeName.put(mainTypeName.substring(dot + 1), main);
+            }
+        }
+
+        Set<Path> dependencyFiles = new LinkedHashSet<>();
         if (extraSchemaPaths != null) {
             for (Path extra : extraSchemaPaths) {
                 Path normalized = extra.toAbsolutePath().normalize();
                 if (!Files.isRegularFile(normalized)) {
                     throw new IllegalArgumentException("Extra schema file not found: " + normalized);
                 }
-                candidates.add(normalized);
+                if (!normalized.equals(main)) {
+                    dependencyFiles.add(normalized);
+                }
             }
         }
 
+        collectDependencyFiles(
+                main,
+                mainTypeName,
+                schemasByTypeName,
+                dependencyFiles);
+
         Schema.Parser parser = new Schema.Parser();
-        Map<Path, Schema> parsed = new LinkedHashMap<>();
-        Set<Path> remaining = new LinkedHashSet<>(candidates);
-        Set<Path> skipped = new LinkedHashSet<>();
+        parseSchemaFiles(parser, dependencyFiles, schemasByTypeName, main);
+
+        Schema mainSchema = parser.parse(main.toFile());
+        ensureRecordFieldsReady(mainSchema, main);
+        return mainSchema;
+    }
+
+    private static void collectDependencyFiles(
+            Path rootSchemaFile,
+            String mainTypeName,
+            Map<String, Path> schemasByTypeName,
+            Set<Path> dependencyFiles) throws IOException {
+        Set<Path> pendingScan = new LinkedHashSet<>();
+        pendingScan.add(rootSchemaFile);
+        Set<Path> scanned = new LinkedHashSet<>();
+        int guard = 0;
+
+        while (!pendingScan.isEmpty()) {
+            if (++guard > 1000) {
+                throw new SchemaParseException("Schema dependency discovery exceeded iteration limit for " + rootSchemaFile);
+            }
+            Path current = pendingScan.iterator().next();
+            pendingScan.remove(current);
+            if (!scanned.add(current)) {
+                continue;
+            }
+
+            JsonNode tree = MAPPER.readTree(stripBom(Files.readString(current, StandardCharsets.UTF_8)));
+            Set<String> namedRefs = new LinkedHashSet<>();
+            collectNamedTypeRefs(tree, namedRefs);
+
+            for (String namedRef : namedRefs) {
+                if (mainTypeName != null
+                        && (namedRef.equals(mainTypeName)
+                        || namedRef.equals(simpleName(mainTypeName)))) {
+                    continue;
+                }
+                Path dependency = findSchemaForType(namedRef, schemasByTypeName, rootSchemaFile.getParent());
+                if (dependency == null || dependency.equals(rootSchemaFile)) {
+                    continue;
+                }
+                if (dependencyFiles.add(dependency)) {
+                    pendingScan.add(dependency);
+                }
+            }
+        }
+    }
+
+    private static void parseSchemaFiles(
+            Schema.Parser parser,
+            Set<Path> files,
+            Map<String, Path> schemasByTypeName,
+            Path main) throws IOException {
+        Set<Path> remaining = new LinkedHashSet<>(files);
         SchemaParseException lastError = null;
         int guard = 0;
 
         while (!remaining.isEmpty()) {
             if (++guard > 1000) {
-                throw new SchemaParseException("Schema dependency resolution exceeded iteration limit for " + main);
+                throw new SchemaParseException("Schema dependency parsing exceeded iteration limit for " + main);
             }
 
             boolean progress = false;
@@ -117,36 +185,24 @@ public final class SendKafkaMessage {
             while (iterator.hasNext()) {
                 Path path = iterator.next();
                 try {
-                    Schema schema = parser.parse(path.toFile());
-                    parsed.put(path, schema);
+                    parser.parse(path.toFile());
                     iterator.remove();
                     progress = true;
                 } catch (SchemaParseException exception) {
                     lastError = exception;
                     String message = exception.getMessage() == null ? "" : exception.getMessage();
-
-                    Matcher redefine = CANT_REDEFINE.matcher(message);
-                    if (redefine.find()) {
-                        // Duplicate type already registered by another file — skip this one.
-                        iterator.remove();
-                        skipped.add(path);
-                        progress = true;
-                        continue;
-                    }
-
                     Matcher missing = UNDEFINED_NAME.matcher(message);
                     if (missing.find()) {
-                        String missingType = missing.group(1);
-                        Path dependency = findSchemaForType(missingType, schemasByTypeName, main.getParent());
+                        Path dependency = findSchemaForType(missing.group(1), schemasByTypeName, main.getParent());
                         if (dependency != null
-                                && !parsed.containsKey(dependency)
-                                && !skipped.contains(dependency)
+                                && !dependency.equals(main)
                                 && remaining.add(dependency)) {
                             progress = true;
                         }
                     }
                 }
             }
+
             if (!progress) {
                 String detail = lastError == null ? "" : lastError.getMessage();
                 throw new SchemaParseException(
@@ -156,19 +212,70 @@ public final class SendKafkaMessage {
                                 + detail);
             }
         }
+    }
 
-        Schema mainSchema = parsed.get(main);
-        if (mainSchema == null) {
-            // Main file was a duplicate of an already-loaded type; reuse the registered schema.
-            String declared = readDeclaredFullName(main);
-            if (declared != null) {
-                mainSchema = parser.getTypes().get(declared);
+    private static void ensureRecordFieldsReady(Schema schema, Path source) {
+        if (schema.getType() != Schema.Type.RECORD) {
+            return;
+        }
+        try {
+            schema.getFields();
+        } catch (AvroRuntimeException exception) {
+            throw new IllegalStateException(
+                    "Parsed schema from " + source + " is an incomplete Avro record ("
+                            + schema.getFullName()
+                            + "). This usually means a sibling .avsc redefined the type. "
+                            + exception.getMessage(),
+                    exception);
+        }
+    }
+
+    private static void collectNamedTypeRefs(JsonNode node, Set<String> namedRefs) {
+        if (node == null || node.isNull()) {
+            return;
+        }
+        if (node.isArray()) {
+            for (JsonNode child : node) {
+                if (child.isTextual()) {
+                    String typeName = child.asText();
+                    if (!AVRO_BUILTINS.contains(typeName)) {
+                        namedRefs.add(typeName);
+                    }
+                } else {
+                    collectNamedTypeRefs(child, namedRefs);
+                }
+            }
+            return;
+        }
+        if (!node.isObject()) {
+            return;
+        }
+
+        JsonNode typeNode = node.get("type");
+        if (typeNode != null) {
+            if (typeNode.isTextual()) {
+                String typeName = typeNode.asText();
+                if (!AVRO_BUILTINS.contains(typeName)) {
+                    namedRefs.add(typeName);
+                }
+            } else {
+                collectNamedTypeRefs(typeNode, namedRefs);
             }
         }
-        if (mainSchema == null) {
-            throw new IllegalStateException("Main schema was not parsed: " + main);
+
+        Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = fields.next();
+            if ("type".equals(entry.getKey())) {
+                continue;
+            }
+            collectNamedTypeRefs(entry.getValue(), namedRefs);
         }
-        return mainSchema;
+    }
+
+    private static String simpleName(String fullName) {
+        int dot = fullName.lastIndexOf('.');
+        return dot >= 0 ? fullName.substring(dot + 1) : fullName;
     }
 
     private static Map<String, Path> indexSiblingSchemas(Path directory) throws IOException {
