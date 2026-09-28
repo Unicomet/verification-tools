@@ -44,7 +44,7 @@ From this directory:
 .\send-kafka.ps1 -Help
 ```
 
-When `-Schema` points at a file that references other named Avro types (for example `NoblePipelineMetadata`), keep those dependency `.avsc` files in the same directory. The CLI loads sibling `*.avsc` files automatically.
+When `-Schema` points at a file that references other named Avro types (for example `NoblePipelineMetadata`), keep those dependency `.avsc` files in the same directory. The CLI loads only the sibling schemas that are actually referenced (so duplicate/unrelated `.avsc` files in that folder are ignored).
 
 ## Files
 

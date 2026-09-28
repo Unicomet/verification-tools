@@ -4,14 +4,18 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.avro.SchemaParseException;
 
@@ -65,10 +69,17 @@ public final class SendKafkaMessage {
         send(properties, options.topic, options.key, stripBom(options.payload), null);
     }
 
+    private static final Pattern UNDEFINED_NAME = Pattern.compile(
+            "\"([^\"]+)\" is not a defined name",
+            Pattern.CASE_INSENSITIVE);
+    private static final Pattern CANT_REDEFINE = Pattern.compile(
+            "Can't redefine:\\s*(\\S+)",
+            Pattern.CASE_INSENSITIVE);
+
     /**
-     * Loads the main schema plus named-type dependencies.
-     * By default every {@code .avsc} beside the main file is loaded (multi-pass) so
-     * references like {@code NoblePipelineMetadata} resolve.
+     * Loads the main schema plus only the named-type dependencies it needs.
+     * Sibling {@code .avsc} files are pulled in on demand when Avro reports a missing
+     * named type, so unrelated/duplicate schemas in the same folder are ignored.
      */
     static Schema loadSchema(Path mainSchemaPath, List<Path> extraSchemaPaths) throws IOException {
         Path main = mainSchemaPath.toAbsolutePath().normalize();
@@ -76,15 +87,8 @@ public final class SendKafkaMessage {
             throw new IllegalArgumentException("Schema file not found: " + main);
         }
 
+        Map<String, Path> schemasByTypeName = indexSiblingSchemas(main.getParent());
         Set<Path> candidates = new LinkedHashSet<>();
-        Path parent = main.getParent();
-        if (parent != null && Files.isDirectory(parent)) {
-            try (DirectoryStream<Path> stream = Files.newDirectoryStream(parent, "*.avsc")) {
-                for (Path path : stream) {
-                    candidates.add(path.toAbsolutePath().normalize());
-                }
-            }
-        }
         candidates.add(main);
         if (extraSchemaPaths != null) {
             for (Path extra : extraSchemaPaths) {
@@ -99,9 +103,15 @@ public final class SendKafkaMessage {
         Schema.Parser parser = new Schema.Parser();
         Map<Path, Schema> parsed = new LinkedHashMap<>();
         Set<Path> remaining = new LinkedHashSet<>(candidates);
+        Set<Path> skipped = new LinkedHashSet<>();
         SchemaParseException lastError = null;
+        int guard = 0;
 
         while (!remaining.isEmpty()) {
+            if (++guard > 1000) {
+                throw new SchemaParseException("Schema dependency resolution exceeded iteration limit for " + main);
+            }
+
             boolean progress = false;
             Iterator<Path> iterator = remaining.iterator();
             while (iterator.hasNext()) {
@@ -113,6 +123,28 @@ public final class SendKafkaMessage {
                     progress = true;
                 } catch (SchemaParseException exception) {
                     lastError = exception;
+                    String message = exception.getMessage() == null ? "" : exception.getMessage();
+
+                    Matcher redefine = CANT_REDEFINE.matcher(message);
+                    if (redefine.find()) {
+                        // Duplicate type already registered by another file — skip this one.
+                        iterator.remove();
+                        skipped.add(path);
+                        progress = true;
+                        continue;
+                    }
+
+                    Matcher missing = UNDEFINED_NAME.matcher(message);
+                    if (missing.find()) {
+                        String missingType = missing.group(1);
+                        Path dependency = findSchemaForType(missingType, schemasByTypeName, main.getParent());
+                        if (dependency != null
+                                && !parsed.containsKey(dependency)
+                                && !skipped.contains(dependency)
+                                && remaining.add(dependency)) {
+                            progress = true;
+                        }
+                    }
                 }
             }
             if (!progress) {
@@ -127,9 +159,90 @@ public final class SendKafkaMessage {
 
         Schema mainSchema = parsed.get(main);
         if (mainSchema == null) {
+            // Main file was a duplicate of an already-loaded type; reuse the registered schema.
+            String declared = readDeclaredFullName(main);
+            if (declared != null) {
+                mainSchema = parser.getTypes().get(declared);
+            }
+        }
+        if (mainSchema == null) {
             throw new IllegalStateException("Main schema was not parsed: " + main);
         }
         return mainSchema;
+    }
+
+    private static Map<String, Path> indexSiblingSchemas(Path directory) throws IOException {
+        Map<String, Path> byTypeName = new HashMap<>();
+        if (directory == null || !Files.isDirectory(directory)) {
+            return byTypeName;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory, "*.avsc")) {
+            for (Path path : stream) {
+                Path normalized = path.toAbsolutePath().normalize();
+                String fullName = readDeclaredFullName(normalized);
+                if (fullName != null) {
+                    byTypeName.putIfAbsent(fullName, normalized);
+                    int dot = fullName.lastIndexOf('.');
+                    if (dot >= 0) {
+                        byTypeName.putIfAbsent(fullName.substring(dot + 1), normalized);
+                    }
+                }
+                String fileBase = stripExtension(normalized.getFileName().toString());
+                byTypeName.putIfAbsent(fileBase, normalized);
+            }
+        }
+        return byTypeName;
+    }
+
+    private static Path findSchemaForType(
+            String missingType,
+            Map<String, Path> schemasByTypeName,
+            Path directory) throws IOException {
+        Path direct = schemasByTypeName.get(missingType);
+        if (direct != null) {
+            return direct;
+        }
+        int dot = missingType.lastIndexOf('.');
+        if (dot >= 0) {
+            Path bySimple = schemasByTypeName.get(missingType.substring(dot + 1));
+            if (bySimple != null) {
+                return bySimple;
+            }
+        }
+        if (directory != null && Files.isDirectory(directory)) {
+            String simple = dot >= 0 ? missingType.substring(dot + 1) : missingType;
+            Path byFileName = directory.resolve(simple + ".avsc");
+            if (Files.isRegularFile(byFileName)) {
+                return byFileName.toAbsolutePath().normalize();
+            }
+        }
+        return null;
+    }
+
+    private static String readDeclaredFullName(Path schemaPath) throws IOException {
+        String content = stripBom(Files.readString(schemaPath, StandardCharsets.UTF_8));
+        JsonNode root = MAPPER.readTree(content);
+        if (root == null || !root.isObject()) {
+            return null;
+        }
+        JsonNode nameNode = root.get("name");
+        if (nameNode == null || nameNode.asText().isBlank()) {
+            return null;
+        }
+        String name = nameNode.asText();
+        if (name.contains(".")) {
+            return name;
+        }
+        JsonNode namespaceNode = root.get("namespace");
+        if (namespaceNode != null && !namespaceNode.asText().isBlank()) {
+            return namespaceNode.asText() + "." + name;
+        }
+        return name;
+    }
+
+    private static String stripExtension(String fileName) {
+        int dot = fileName.toLowerCase(Locale.ROOT).lastIndexOf('.');
+        return dot >= 0 ? fileName.substring(0, dot) : fileName;
     }
 
     private static String stripBom(String payload) {
