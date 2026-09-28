@@ -20,7 +20,6 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
     [string]$Topic,
 
     [string]$Message,
@@ -28,6 +27,8 @@ param(
     [string]$File,
 
     [string]$Schema,
+
+    [string[]]$SchemaExtra = @(),
 
     [string]$Key,
 
@@ -85,7 +86,8 @@ Options:
   -Topic <topic>                   required
   -Message <text>                  payload text/JSON
   -File <path>                     payload from file
-  -Schema <path.avsc>              Avro mode + Schema Registry
+  -Schema <path.avsc>              Avro mode + Schema Registry (loads sibling *.avsc too)
+  -SchemaExtra <path.avsc>         Extra dependency schema(s), repeatable
   -Key <key>
   -HostName <host>                 default: localhost
   -KafkaPort <port>                default: 9092
@@ -97,6 +99,9 @@ Options:
     exit 0
 }
 
+if (-not $Topic) {
+    throw "Provide -Topic."
+}
 if ($Message -and $File) {
     throw "Use only one of -Message or -File."
 }
@@ -108,6 +113,11 @@ if ($File -and -not (Test-Path -LiteralPath $File)) {
 }
 if ($Schema -and -not (Test-Path -LiteralPath $Schema)) {
     throw "Schema file not found: $Schema"
+}
+foreach ($extra in $SchemaExtra) {
+    if (-not (Test-Path -LiteralPath $extra)) {
+        throw "Extra schema file not found: $extra"
+    }
 }
 
 $toolRoot = $PSScriptRoot
@@ -172,6 +182,9 @@ if ($Brokers) { $javaArgs += @("--brokers", $Brokers) }
 if ($SchemaRegistry) { $javaArgs += @("--schema-registry", $SchemaRegistry) }
 if ($Key) { $javaArgs += @("--key", $Key) }
 if ($Schema) { $javaArgs += @("--schema", (Resolve-Path -LiteralPath $Schema).Path) }
+foreach ($extra in $SchemaExtra) {
+    $javaArgs += @("--schema-extra", (Resolve-Path -LiteralPath $extra).Path)
+}
 if ($File) {
     $javaArgs += @("--file", (Resolve-Path -LiteralPath $File).Path)
 } else {

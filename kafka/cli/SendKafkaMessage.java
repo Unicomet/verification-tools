@@ -1,13 +1,19 @@
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+
+import org.apache.avro.SchemaParseException;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -49,7 +55,7 @@ public final class SendKafkaMessage {
             properties.put(AbstractKafkaSchemaSerDeConfig.AUTO_REGISTER_SCHEMAS, true);
             properties.put(KafkaAvroSerializerConfig.AVRO_REMOVE_JAVA_PROPS_CONFIG, true);
 
-            Schema schema = new Schema.Parser().parse(Path.of(options.schemaPath).toFile());
+            Schema schema = loadSchema(Path.of(options.schemaPath), options.extraSchemaPaths);
             Object value = convert(schema, MAPPER.readTree(stripBom(options.payload)));
             send(properties, options.topic, options.key, value, options.schemaRegistry);
             return;
@@ -57,6 +63,73 @@ public final class SendKafkaMessage {
 
         properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         send(properties, options.topic, options.key, stripBom(options.payload), null);
+    }
+
+    /**
+     * Loads the main schema plus named-type dependencies.
+     * By default every {@code .avsc} beside the main file is loaded (multi-pass) so
+     * references like {@code NoblePipelineMetadata} resolve.
+     */
+    static Schema loadSchema(Path mainSchemaPath, List<Path> extraSchemaPaths) throws IOException {
+        Path main = mainSchemaPath.toAbsolutePath().normalize();
+        if (!Files.isRegularFile(main)) {
+            throw new IllegalArgumentException("Schema file not found: " + main);
+        }
+
+        Set<Path> candidates = new LinkedHashSet<>();
+        Path parent = main.getParent();
+        if (parent != null && Files.isDirectory(parent)) {
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(parent, "*.avsc")) {
+                for (Path path : stream) {
+                    candidates.add(path.toAbsolutePath().normalize());
+                }
+            }
+        }
+        candidates.add(main);
+        if (extraSchemaPaths != null) {
+            for (Path extra : extraSchemaPaths) {
+                Path normalized = extra.toAbsolutePath().normalize();
+                if (!Files.isRegularFile(normalized)) {
+                    throw new IllegalArgumentException("Extra schema file not found: " + normalized);
+                }
+                candidates.add(normalized);
+            }
+        }
+
+        Schema.Parser parser = new Schema.Parser();
+        Map<Path, Schema> parsed = new LinkedHashMap<>();
+        Set<Path> remaining = new LinkedHashSet<>(candidates);
+        SchemaParseException lastError = null;
+
+        while (!remaining.isEmpty()) {
+            boolean progress = false;
+            Iterator<Path> iterator = remaining.iterator();
+            while (iterator.hasNext()) {
+                Path path = iterator.next();
+                try {
+                    Schema schema = parser.parse(path.toFile());
+                    parsed.put(path, schema);
+                    iterator.remove();
+                    progress = true;
+                } catch (SchemaParseException exception) {
+                    lastError = exception;
+                }
+            }
+            if (!progress) {
+                String detail = lastError == null ? "" : lastError.getMessage();
+                throw new SchemaParseException(
+                        "Could not resolve Avro named types while parsing "
+                                + main
+                                + ". Put dependency .avsc files next to the main schema, or pass --schema-extra. "
+                                + detail);
+            }
+        }
+
+        Schema mainSchema = parsed.get(main);
+        if (mainSchema == null) {
+            throw new IllegalStateException("Main schema was not parsed: " + main);
+        }
+        return mainSchema;
     }
 
     private static String stripBom(String payload) {
@@ -242,6 +315,7 @@ public final class SendKafkaMessage {
         private final String topic;
         private final String key;
         private final String schemaPath;
+        private final List<Path> extraSchemaPaths;
         private final String payload;
 
         private Options(
@@ -250,12 +324,14 @@ public final class SendKafkaMessage {
                 String topic,
                 String key,
                 String schemaPath,
+                List<Path> extraSchemaPaths,
                 String payload) {
             this.brokers = brokers;
             this.schemaRegistry = schemaRegistry;
             this.topic = topic;
             this.key = key;
             this.schemaPath = schemaPath;
+            this.extraSchemaPaths = extraSchemaPaths;
             this.payload = payload;
         }
 
@@ -268,6 +344,7 @@ public final class SendKafkaMessage {
             String topic = null;
             String key = null;
             String schemaPath = null;
+            List<Path> extraSchemaPaths = new ArrayList<>();
             String message = null;
             String file = null;
 
@@ -302,6 +379,9 @@ public final class SendKafkaMessage {
                         break;
                     case "--schema":
                         schemaPath = requireValue(args, ++i, arg);
+                        break;
+                    case "--schema-extra":
+                        extraSchemaPaths.add(Path.of(requireValue(args, ++i, arg)));
                         break;
                     case "--message":
                         message = requireValue(args, ++i, arg);
@@ -346,6 +426,7 @@ public final class SendKafkaMessage {
                     topic,
                     key,
                     schemaPath,
+                    extraSchemaPaths,
                     payload);
         }
 
@@ -366,6 +447,8 @@ public final class SendKafkaMessage {
                     + "\n"
                     + "Avro:\n"
                     + "  --schema <path.avsc>             enable Avro + Schema Registry\n"
+                    + "                                  also loads sibling *.avsc as named-type deps\n"
+                    + "  --schema-extra <path.avsc>       extra dependency schema (repeatable)\n"
                     + "\n"
                     + "Connection (defaults match local Docker):\n"
                     + "  --host <host>                    default: localhost\n"
