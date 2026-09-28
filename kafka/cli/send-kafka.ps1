@@ -185,16 +185,27 @@ if ($Schema) { $javaArgs += @("--schema", (Resolve-Path -LiteralPath $Schema).Pa
 foreach ($extra in $SchemaExtra) {
     $javaArgs += @("--schema-extra", (Resolve-Path -LiteralPath $extra).Path)
 }
+# PowerShell mangles double-quotes when splatting JSON into a native java.exe
+# process. Always hand the payload to Java via --file.
+$tempPayloadFile = $null
 if ($File) {
     $javaArgs += @("--file", (Resolve-Path -LiteralPath $File).Path)
 } else {
-    $javaArgs += @("--message", $Message)
+    $tempPayloadFile = Join-Path ([System.IO.Path]::GetTempPath()) ("send-kafka-payload-" + [guid]::NewGuid().ToString("N") + ".txt")
+    [System.IO.File]::WriteAllText($tempPayloadFile, $Message, [System.Text.UTF8Encoding]::new($false))
+    $javaArgs += @("--file", $tempPayloadFile)
 }
 
 $runClasspath = "$producerClasses;$dependencyClasspath"
 $format = if ($Schema) { "avro" } else { "string" }
 Write-Host "Sending $format message to $Topic ..."
-& $javaExecutable -cp $runClasspath SendKafkaMessage @javaArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "Kafka publish failed with exit code $LASTEXITCODE"
+try {
+    & $javaExecutable -cp $runClasspath SendKafkaMessage @javaArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Kafka publish failed with exit code $LASTEXITCODE"
+    }
+} finally {
+    if ($tempPayloadFile -and (Test-Path -LiteralPath $tempPayloadFile)) {
+        Remove-Item -LiteralPath $tempPayloadFile -Force -ErrorAction SilentlyContinue
+    }
 }

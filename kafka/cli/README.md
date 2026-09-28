@@ -27,7 +27,7 @@ From this directory:
 # string
 .\send-kafka.ps1 -Topic my-topic -Message "hello"
 
-# avro
+# avro (prefer -File for JSON payloads)
 .\send-kafka.ps1 -Topic my-topic -Schema .\schema.avsc -File .\message.json
 
 # avro with named-type deps in the same folder (auto-loaded)
