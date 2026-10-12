@@ -1,12 +1,12 @@
 # verification-tools
 
-Small reusable tools for local service verification.
+Reusable CLIs for local service verification on Windows PowerShell.
 
-## Layout
+## Tools
 
-| Path | Purpose |
+| Path | What it does |
 |---|---|
-| `kafka/cli` | Send string or Avro messages to a local Kafka broker |
-| `oracle/cli` | Print selected Oracle tables as terminal evidence |
+| [`kafka/cli`](kafka/cli/README.md) | Send a string or Avro message to a Kafka topic |
+| [`oracle/cli`](oracle/cli/README.md) | Print selected Oracle table rows as terminal evidence |
 
-See each tool's README for usage.
+Each tool folder has a how-to README and a flag reference.

@@ -1,56 +1,89 @@
-# Kafka send CLI
+# How to send a Kafka message
 
-Minimal local producer for any Kafka topic.
-
-- **String mode:** send plain text
-- **Avro mode:** send JSON against an `.avsc` schema via Schema Registry
-
-Defaults: Kafka `localhost:9092`, Schema Registry `http://localhost:8089`.
+Use this CLI when you need to put one message on a local Kafka topic from PowerShell. You can send plain text, or JSON that Schema Registry encodes as Avro.
 
 ## Requirements
 
-- JDK 17+
-- Maven 3+
-- Reachable Kafka (and Schema Registry for Avro)
+- JDK 17 or newer (`java` and `javac` on `PATH`, or `JAVA_HOME` set)
+- Maven 3+ (`mvn` on `PATH`)
+- A reachable Kafka broker
+- For Avro mode, a reachable Schema Registry
 
 ## Start local Kafka (optional)
+
+From this directory, start the bundled broker and Schema Registry:
 
 ```powershell
 docker compose -f kafka-compose.yml up -d
 ```
 
-## Usage
+That compose file publishes Kafka on `localhost:9092` and Schema Registry on `http://localhost:8089`. Those are the CLI defaults.
 
-From this directory:
+## Send a string message
 
 ```powershell
-# string
 .\send-kafka.ps1 -Topic my-topic -Message "hello"
-
-# avro (prefer -File for JSON payloads)
-.\send-kafka.ps1 -Topic my-topic -Schema .\schema.avsc -File .\message.json
-
-# avro with named-type deps in the same folder (auto-loaded)
-.\send-kafka.ps1 -Topic my-topic -Schema .\ScoringCompletenessKpi.avsc -File .\message.json
-
-# avro with a dependency schema outside that folder
-.\send-kafka.ps1 -Topic my-topic -Schema .\main.avsc -SchemaExtra .\deps\OtherType.avsc -File .\message.json
-
-# custom ports
-.\send-kafka.ps1 -Topic my-topic -Message "hello" -KafkaPort 19092 -SchemaRegistryPort 18089
 ```
+
+The command fails if Kafka is not reachable at the configured brokers.
+
+## Send a payload from a file
+
+```powershell
+.\send-kafka.ps1 -Topic my-topic -File .\message.txt
+```
+
+Pass exactly one of `-Message` or `-File`.
+
+## Send an Avro message
+
+1. Put the primary `.avsc` schema next to any named-type dependency schemas it references.
+2. Put the JSON payload in a file.
+3. Run:
+
+```powershell
+.\send-kafka.ps1 -Topic my-topic -Schema .\schema.avsc -File .\message.json
+```
+
+The CLI loads sibling `.avsc` files in the same folder as `-Schema` only when the primary schema references those named types. Unrelated sibling schemas are ignored.
+
+If a dependency schema lives outside that folder, pass it with `-SchemaExtra`:
+
+```powershell
+.\send-kafka.ps1 -Topic my-topic -Schema .\main.avsc -SchemaExtra .\deps\OtherType.avsc -File .\message.json
+```
+
+You can repeat `-SchemaExtra`.
+
+## Point at a different broker or Schema Registry
+
+Override the host and ports:
+
+```powershell
+.\send-kafka.ps1 -Topic my-topic -Message "hello" -HostName 127.0.0.1 -KafkaPort 19092 -SchemaRegistryPort 18089
+```
+
+Or pass full endpoints:
+
+```powershell
+.\send-kafka.ps1 -Topic my-topic -Message "hello" -Brokers 127.0.0.1:19092
+.\send-kafka.ps1 -Topic my-topic -Schema .\schema.avsc -File .\message.json -SchemaRegistry http://127.0.0.1:18089
+```
+
+`-Brokers` replaces `-HostName` and `-KafkaPort`. `-SchemaRegistry` replaces `-HostName` and `-SchemaRegistryPort`.
+
+## Set a message key
+
+```powershell
+.\send-kafka.ps1 -Topic my-topic -Message "hello" -Key order-42
+```
+
+## Show built-in help
 
 ```powershell
 .\send-kafka.ps1 -Help
 ```
 
-When `-Schema` points at a file that references other named Avro types (for example `NoblePipelineMetadata`), keep those dependency `.avsc` files in the same directory. The CLI loads only the sibling schemas that are actually referenced (so duplicate/unrelated `.avsc` files in that folder are ignored).
+## Flag reference
 
-## Files
-
-| File | Role |
-|---|---|
-| `send-kafka.ps1` | CLI entrypoint |
-| `SendKafkaMessage.java` | Producer |
-| `pom.xml` | Runtime dependencies |
-| `kafka-compose.yml` | Local Kafka + Schema Registry |
+See [REFERENCE.md](REFERENCE.md) for every parameter, default, and constraint.
