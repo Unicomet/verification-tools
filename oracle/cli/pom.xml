@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>tools.verification.oracle</groupId>
+  <artifactId>show-tables-cli</artifactId>
+  <version>1.0.0</version>
+  <name>show-tables-cli</name>
+  <description>Print selected Oracle tables as terminal evidence</description>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <ojdbc.version>21.9.0.0</ojdbc.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.oracle.database.jdbc</groupId>
+      <artifactId>ojdbc11</artifactId>
+      <version>${ojdbc.version}</version>
+    </dependency>
+  </dependencies>
+</project>
